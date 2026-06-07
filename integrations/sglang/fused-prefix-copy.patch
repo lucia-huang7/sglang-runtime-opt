@@ -1,0 +1,55 @@
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -34,6 +34,7 @@
+ import copy
+ import dataclasses
+ import logging
++import os
+ import threading
+ from enum import Enum, auto
+ from http import HTTPStatus
+@@ -43,6 +44,10 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++from runtime_opt.prefix_copy import try_fused_prefix_copy
++
++_FUSED_PREFIX_COPY = os.environ.get("SGLANG_FUSED_PREFIX_COPY", "0") == "1"
+ 
+ from sglang.global_config import global_config
+ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+@@ -1160,14 +1165,30 @@
+         extend_input_logprob_token_ids = []
+         multimodal_inputs = []
+ 
++        prefix_copied = False
++        if (
++            _FUSED_PREFIX_COPY
++            and bs >= 16
++            and sum(length > 0 for length in prefix_lens) >= 16
++            and not isinstance(self.tree_cache, SWAChunkCache)
++        ):
++            for req, seq_len, pre_len in zip(reqs, seq_lens, prefix_lens):
++                assert seq_len - pre_len == req.extend_input_len
++            prefix_copied = try_fused_prefix_copy(
++                self.req_to_token_pool.req_to_token,
++                req_pool_indices,
++                [req.prefix_indices for req in reqs],
++            )
++
+         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
+             req.req_pool_idx = req_pool_indices[i]
+             assert seq_len - pre_len == req.extend_input_len
+ 
+             if pre_len > 0:
+-                self.req_to_token_pool.write(
+-                    (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
+-                )
++                if not prefix_copied:
++                    self.req_to_token_pool.write(
++                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
++                    )
+                 if isinstance(self.tree_cache, SWAChunkCache):
+                     self.tree_cache.evict_swa(
+                         req, pre_len, self.model_config.attention_chunk_size
