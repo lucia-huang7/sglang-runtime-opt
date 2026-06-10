@@ -1,0 +1,107 @@
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -2010,6 +2010,13 @@
+             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
+             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
+             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
++            async_metadata_mode=(
++                os.getenv("SGLANG_ASYNC_METADATA")
++                if self.server_args.disable_overlap_schedule
++                and self.spec_algorithm.is_none() and self.is_generation
++                and self.pp_size == 1 and not self.server_args.enable_two_batch_overlap
++                else None
++            ),
+         )
+ 
+     @staticmethod
+@@ -2027,6 +2034,7 @@
+         deepep_mode: DeepEPMode,
+         require_mlp_tp_gather: bool,
+         disable_overlap_schedule: bool,
++        async_metadata_mode=None,
+     ):
+         # Check if other DP workers have running batches
+         if local_batch is None:
+@@ -2064,8 +2072,7 @@
+             group = tp_group.cpu_group
+             device = "cpu"
+ 
+-        local_info = torch.tensor(
+-            [
++        local_values = [
+                 num_tokens,
+                 can_cuda_graph,
+                 num_tokens_for_logprob,
+@@ -2076,20 +2083,32 @@
+                     enable_deepep_moe,
+                     enable_two_batch_overlap,
+                 ),
+-            ],
+-            dtype=torch.int64,
+-            device=device,
+-        )
+-        global_info = torch.empty(
+-            (dp_size, attn_tp_size, 6),
+-            dtype=torch.int64,
+-            device=device,
+-        )
+-        torch.distributed.all_gather_into_tensor(
+-            global_info.flatten(),
+-            local_info,
+-            group=group,
+-        )
++            ]
++        descriptor = None
++        if async_metadata_mode in ("immediate", "overlap") and disable_overlap_schedule:
++            from runtime_opt.async_metadata import (
++                MetadataGather, prebuild_worker_batch,
++            )
++            key = (str(device), len(local_values))
++            cache = getattr(tp_group, "_runtime_metadata_gathers", None)
++            if cache is None:
++                cache = tp_group._runtime_metadata_gathers = {}
++            if key not in cache:
++                cache[key] = MetadataGather(len(local_values), group, device)
++            pending = cache[key].start(local_values)
++            try:
++                if async_metadata_mode == "overlap":
++                    descriptor = prebuild_worker_batch(local_batch)
++            finally:
++                # Drain the collective even if local descriptor construction fails.
++                global_info = pending.finish().view(dp_size, attn_tp_size, 6)
++        else:
++            local_info = torch.tensor(local_values, dtype=torch.int64, device=device)
++            global_info = torch.empty((dp_size, attn_tp_size, 6),
++                                      dtype=torch.int64, device=device)
++            torch.distributed.all_gather_into_tensor(
++                global_info.flatten(), local_info, group=group,
++            )
+         global_num_tokens = global_info[:, 0, 0].tolist()
+         can_cuda_graph = min(global_info[:, 0, 1].tolist())
+         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
+@@ -2119,6 +2138,10 @@
+             # Check forward mode for cuda graph
+             if not disable_cuda_graph:
+                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
++
++        if descriptor is not None:
++            from runtime_opt.async_metadata import publish_worker_batch
++            publish_worker_batch(local_batch, descriptor)
+ 
+         return local_batch
+ 
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1704,6 +1704,12 @@
+     def get_model_worker_batch(
+         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+     ) -> ModelWorkerBatch:
++        descriptor = getattr(self, "_pending_worker_descriptor", None)
++        if descriptor is not None:
++            if seq_lens_cpu_cache is not None:
++                raise RuntimeError("Cached descriptor does not accept a CPU-length override")
++            self._pending_worker_descriptor = None
++            return descriptor
+         if self.forward_mode.is_decode_or_idle():
+             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+         else:

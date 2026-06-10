@@ -70,3 +70,20 @@ class MetadataGather:
             self.finish()
 
 
+def prebuild_worker_batch(batch):
+    """Build the actual upstream descriptor before global metadata is consumed."""
+    if batch is None:
+        return None
+    if getattr(batch, '_pending_worker_descriptor', None) is not None:
+        raise RuntimeError('Unconsumed model-worker descriptor')
+    return batch.get_model_worker_batch()
+
+
+def publish_worker_batch(batch, descriptor):
+    if descriptor is None:
+        return
+    for name in ('global_num_tokens', 'global_num_tokens_for_logprob',
+                 'is_extend_in_batch', 'can_run_dp_cuda_graph',
+                 'tbo_split_seq_index', 'global_forward_mode'):
+        setattr(descriptor, name, getattr(batch, name))
+    batch._pending_worker_descriptor = descriptor
