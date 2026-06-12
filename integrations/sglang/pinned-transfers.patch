@@ -1,0 +1,244 @@
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1139,18 +1139,28 @@
+             r.token_type_ids for r in reqs if r.token_type_ids is not None
+         ]
+ 
+-        req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
+-            self.device, non_blocking=True
+-        )
+-        input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
+-            self.device, non_blocking=True
+-        )
+-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+-            self.device, non_blocking=True
+-        )
+-        prefix_lens_tensor = torch.tensor(
+-            prefix_lens, dtype=torch.int64, device=self.device
+-        )
++        packed_inputs = None
++        if os.getenv("SGLANG_PINNED_INPUTS") == "1" and str(self.device).startswith("cuda"):
++            from runtime_opt.pinned_transfers import pack_scheduler_inputs
++            packed_inputs = pack_scheduler_inputs(
++                [req_pool_indices, sum(input_ids, []), seq_lens, prefix_lens], self.device
++            )
++        if packed_inputs is not None:
++            (req_pool_indices_tensor, input_ids_tensor,
++             seq_lens_tensor, prefix_lens_tensor) = packed_inputs
++        else:
++            req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
++                self.device, non_blocking=True
++            )
++            input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
++                self.device, non_blocking=True
++            )
++            seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
++                self.device, non_blocking=True
++            )
++            prefix_lens_tensor = torch.tensor(
++                prefix_lens, dtype=torch.int64, device=self.device
++            )
+ 
+         token_type_ids_tensor = None
+         if len(token_type_ids) > 0:
+@@ -1710,93 +1720,115 @@
+                 raise RuntimeError("Cached descriptor does not accept a CPU-length override")
+             self._pending_worker_descriptor = None
+             return descriptor
+-        if self.forward_mode.is_decode_or_idle():
+-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+-        else:
+-            extend_seq_lens = self.extend_lens
+-            extend_prefix_lens = self.prefix_lens
+-            extend_logprob_start_lens = self.extend_logprob_start_lens
+-
+-        if self.forward_mode.is_decode_or_idle():
+-            attention_backend_str = global_server_args_dict["decode_attention_backend"]
+-        else:
+-            attention_backend_str = global_server_args_dict["prefill_attention_backend"]
+-        # Create seq_lens_cpu when needed
+-        if (
+-            attention_backend_str == "fa3"
+-            or (
+-                global_server_args_dict["use_mla_backend"]
+-                and attention_backend_str == "flashinfer"
+-            )
+-            or attention_backend_str == "flashmla"
+-            or attention_backend_str == "cutlass_mla"
+-            or attention_backend_str == "ascend"
+-            or global_server_args_dict["enable_two_batch_overlap"]
+-        ):
+-            seq_lens_cpu = (
+-                seq_lens_cpu_cache
+-                if seq_lens_cpu_cache is not None
+-                else self.seq_lens.cpu()
+-            )
+-        else:
+-            seq_lens_cpu = None
+-
+-        if self.sampling_info:
+-            if self.has_grammar:
+-                self.sampling_info.grammars = [req.grammar for req in self.reqs]
++        length_transfer = None
++        if (os.getenv("SGLANG_PINNED_LENGTHS") == "1"
++                and seq_lens_cpu_cache is None and self.seq_lens is not None):
++            backend = global_server_args_dict[
++                "decode_attention_backend" if self.forward_mode.is_decode_or_idle()
++                else "prefill_attention_backend"
++            ]
++            needs_cpu = (backend in ("fa3", "flashmla", "cutlass_mla", "ascend")
++                         or (global_server_args_dict["use_mla_backend"] and backend == "flashinfer")
++                         or global_server_args_dict["enable_two_batch_overlap"])
++            if needs_cpu:
++                from runtime_opt.pinned_transfers import begin_sequence_lengths
++                length_transfer = begin_sequence_lengths(self.seq_lens)
++        try:
++            if self.forward_mode.is_decode_or_idle():
++                extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+             else:
+-                self.sampling_info.grammars = None
+-
+-        global bid
+-        bid += 1
+-        return ModelWorkerBatch(
+-            bid=bid,
+-            forward_mode=self.forward_mode,
+-            input_ids=self.input_ids,
+-            req_pool_indices=self.req_pool_indices,
+-            seq_lens=self.seq_lens,
+-            out_cache_loc=self.out_cache_loc,
+-            seq_lens_cpu=seq_lens_cpu,
+-            seq_lens_sum=self.seq_lens_sum,
+-            return_logprob=self.return_logprob,
+-            top_logprobs_nums=self.top_logprobs_nums,
+-            token_ids_logprobs=self.token_ids_logprobs,
+-            global_num_tokens=self.global_num_tokens,
+-            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+-            is_extend_in_batch=self.is_extend_in_batch,
+-            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+-            tbo_split_seq_index=self.tbo_split_seq_index,
+-            global_forward_mode=self.global_forward_mode,
+-            extend_num_tokens=self.extend_num_tokens,
+-            extend_seq_lens=extend_seq_lens,
+-            extend_prefix_lens=extend_prefix_lens,
+-            extend_logprob_start_lens=extend_logprob_start_lens,
+-            multimodal_inputs=self.multimodal_inputs,
+-            encoder_cached=self.encoder_cached,
+-            encoder_lens=self.encoder_lens,
+-            encoder_lens_cpu=self.encoder_lens_cpu,
+-            encoder_out_cache_loc=self.encoder_out_cache_loc,
+-            lora_paths=[req.lora_path for req in self.reqs],
+-            sampling_info=self.sampling_info,
+-            input_embeds=self.input_embeds,
+-            token_type_ids=self.token_type_ids,
+-            spec_algorithm=self.spec_algorithm,
+-            spec_info=self.spec_info,
+-            hicache_consumer_index=self.hicache_consumer_index,
+-            capture_hidden_mode=(
+-                CaptureHiddenMode.FULL
+-                if self.return_hidden_states
+-                else (
+-                    getattr(
+-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
++                extend_seq_lens = self.extend_lens
++                extend_prefix_lens = self.prefix_lens
++                extend_logprob_start_lens = self.extend_logprob_start_lens
++    
++            if self.forward_mode.is_decode_or_idle():
++                attention_backend_str = global_server_args_dict["decode_attention_backend"]
++            else:
++                attention_backend_str = global_server_args_dict["prefill_attention_backend"]
++            # Create seq_lens_cpu when needed
++            if (
++                attention_backend_str == "fa3"
++                or (
++                    global_server_args_dict["use_mla_backend"]
++                    and attention_backend_str == "flashinfer"
++                )
++                or attention_backend_str == "flashmla"
++                or attention_backend_str == "cutlass_mla"
++                or attention_backend_str == "ascend"
++                or global_server_args_dict["enable_two_batch_overlap"]
++            ):
++                seq_lens_cpu = (
++                    seq_lens_cpu_cache
++                    if seq_lens_cpu_cache is not None
++                    else (None if length_transfer is not None else self.seq_lens.cpu())
++                )
++            else:
++                seq_lens_cpu = None
++    
++            if self.sampling_info:
++                if self.has_grammar:
++                    self.sampling_info.grammars = [req.grammar for req in self.reqs]
++                else:
++                    self.sampling_info.grammars = None
++    
++            global bid
++            bid += 1
++            worker_batch = ModelWorkerBatch(
++                bid=bid,
++                forward_mode=self.forward_mode,
++                input_ids=self.input_ids,
++                req_pool_indices=self.req_pool_indices,
++                seq_lens=self.seq_lens,
++                out_cache_loc=self.out_cache_loc,
++                seq_lens_cpu=seq_lens_cpu,
++                seq_lens_sum=self.seq_lens_sum,
++                return_logprob=self.return_logprob,
++                top_logprobs_nums=self.top_logprobs_nums,
++                token_ids_logprobs=self.token_ids_logprobs,
++                global_num_tokens=self.global_num_tokens,
++                global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
++                is_extend_in_batch=self.is_extend_in_batch,
++                can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
++                tbo_split_seq_index=self.tbo_split_seq_index,
++                global_forward_mode=self.global_forward_mode,
++                extend_num_tokens=self.extend_num_tokens,
++                extend_seq_lens=extend_seq_lens,
++                extend_prefix_lens=extend_prefix_lens,
++                extend_logprob_start_lens=extend_logprob_start_lens,
++                multimodal_inputs=self.multimodal_inputs,
++                encoder_cached=self.encoder_cached,
++                encoder_lens=self.encoder_lens,
++                encoder_lens_cpu=self.encoder_lens_cpu,
++                encoder_out_cache_loc=self.encoder_out_cache_loc,
++                lora_paths=[req.lora_path for req in self.reqs],
++                sampling_info=self.sampling_info,
++                input_embeds=self.input_embeds,
++                token_type_ids=self.token_type_ids,
++                spec_algorithm=self.spec_algorithm,
++                spec_info=self.spec_info,
++                hicache_consumer_index=self.hicache_consumer_index,
++                capture_hidden_mode=(
++                    CaptureHiddenMode.FULL
++                    if self.return_hidden_states
++                    else (
++                        getattr(
++                            self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
++                        )
++                        if self.spec_info
++                        else CaptureHiddenMode.NULL
+                     )
+-                    if self.spec_info
+-                    else CaptureHiddenMode.NULL
+-                )
+-            ),
+-            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+-            launch_done=self.launch_done,
+-        )
++                ),
++                extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
++                launch_done=self.launch_done,
++            )
++            if length_transfer is not None:
++                # The returned worker owns its CPU copy beyond ring reuse.
++                worker_batch.seq_lens_cpu = length_transfer.consume(owned=True)
++            return worker_batch
++    
++        finally:
++            if length_transfer is not None and not length_transfer.released:
++                length_transfer.release()
+ 
+     def copy(self):
+         # Only contain fields that will be used by process_batch_result

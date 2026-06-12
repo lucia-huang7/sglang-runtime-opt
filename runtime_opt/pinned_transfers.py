@@ -131,3 +131,44 @@ _INPUT_RINGS = {}
 _LENGTH_RINGS = {}
 
 
+def pack_scheduler_inputs(groups, device):
+    """Pack four CPU integer lists into one owned CUDA allocation."""
+    lengths = [len(group) for group in groups]
+    count = 0
+    for length in lengths: count = (count + 31) // 32 * 32 + length
+    if not sum(lengths) or count > 1 << 20 or torch.cuda.is_current_stream_capturing():
+        return None
+    dev = torch.device(device)
+    if dev.index is None: dev = torch.device('cuda', torch.cuda.current_device())
+    capacity = max(256, 1 << (count - 1).bit_length())
+    key = (dev, capacity)
+    if key not in _INPUT_RINGS:
+        for old_key in list(_INPUT_RINGS):
+            if old_key[0] == dev: _INPUT_RINGS.pop(old_key).close()
+        _INPUT_RINGS[key] = PinnedTransferRing(capacity, torch.int64, dev, depth=2)
+    ring = _INPUT_RINGS[key]
+    slot = ring._acquire(count)
+    from runtime_opt.integer_staging import initialize
+    try:
+        result = initialize().pack_and_upload(slot.host, groups, dev.index if dev.index is not None else torch.cuda.current_device())
+    except (TypeError, OverflowError):
+        return None
+    # Source consumers already run on this stream; no cross-stream join is needed.
+    slot.ready.record(torch.cuda.current_stream(dev))
+    slot.active = True
+    return result
+
+
+def begin_sequence_lengths(source):
+    if source.device.type != 'cuda' or source.dtype != torch.int64 or not source.is_contiguous():
+        return None
+    if not source.numel() or source.numel() > 1 << 20 or torch.cuda.is_current_stream_capturing():
+        return None
+    capacity=max(256,1 << (source.numel()-1).bit_length())
+    key=(source.device,capacity)
+    if key not in _LENGTH_RINGS:
+        for old_key in list(_LENGTH_RINGS):
+            if old_key[0] == source.device: _LENGTH_RINGS.pop(old_key).close()
+        _LENGTH_RINGS[key]=PinnedTransferRing(capacity,torch.int64,source.device,depth=2)
+    try:return _LENGTH_RINGS[key].download(source)
+    except BufferError:return None
