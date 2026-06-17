@@ -1,0 +1,47 @@
+--- a/python/sglang/srt/speculative/eagle_utils.py
++++ b/python/sglang/srt/speculative/eagle_utils.py
+@@ -492,8 +492,32 @@
+ 
+         unfinished_index = []
+         unfinished_accept_index = []
+-        accept_index_cpu = accept_index.tolist()
+-        predict_cpu = predict.tolist()
++        acceptance_cap = __import__("os").environ.get("SGLANG_VERIFY_ACCEPTANCE_CAP")
++        if acceptance_cap is not None:
++            cap = int(acceptance_cap)
++            if not 0 <= cap <= self.spec_steps:
++                raise ValueError("Invalid verification acceptance cap")
++            positions = torch.arange(accept_index.shape[1], device=accept_index.device)
++            accept_index = torch.where(positions[None, :] > cap, -1, accept_index)
++            accept_length = accept_length.clamp_max(cap)
++        packed_accept_length_cpu = None
++        if __import__("os").environ.get("SGLANG_PACKED_VERIFY_D2H") == "1":
++            from runtime_opt.verification_transfer import VerificationSnapshot
++            from runtime_opt.tentative_draft import current_worker, eligible, start_tentative
++            worker = current_worker()
++            can_tentatively_extend = eligible(worker, batch, self)
++            transfer_stream = None
++            if can_tentatively_extend:
++                if not hasattr(worker, "_runtime_verify_stream"):
++                    worker._runtime_verify_stream = torch.cuda.Stream(device=predict.device)
++                transfer_stream = worker._runtime_verify_stream
++            transfer = VerificationSnapshot(accept_index, predict, accept_length, stream=transfer_stream)
++            if can_tentatively_extend:
++                start_tentative(batch, self, target_predict)
++            accept_index_cpu, predict_cpu, packed_accept_length_cpu = transfer.result()
++        else:
++            accept_index_cpu = accept_index.tolist()
++            predict_cpu = predict.tolist()
+         has_finished = False
+ 
+         # Iterate every accepted token and check if req has finished after append the token
+@@ -617,7 +641,8 @@
+                 hidden_states=batch.spec_info.hidden_states[accept_index],
+                 verified_id=verified_id,
+                 accept_length=accept_length,
+-                accept_length_cpu=accept_length.tolist(),
++                accept_length_cpu=(packed_accept_length_cpu if packed_accept_length_cpu is not None
++                                   else accept_length.tolist()),
+                 seq_lens_for_draft_extend=batch.seq_lens,
+                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
+             )
